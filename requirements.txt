@@ -1,0 +1,14 @@
+# ReconShield ML service
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
+python-dotenv>=1.0
+
+# Model training / inference
+scikit-learn>=1.5
+pandas>=2.2
+numpy>=1.26
+joblib>=1.4
+
+# Database sync (same PostgreSQL used by reconshield-web)
+psycopg2-binary>=2.9
