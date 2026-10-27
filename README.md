@@ -20,6 +20,7 @@ reconshield-ml/
 ├── training/
 │   ├── train_rf.py       # Train RandomForest -> models/*.joblib + metrics.json
 │   └── sync_metrics_db.py# Push latest metrics.json into PostgreSQL
+├── pipeline/            # detect.py (NetFlow -> model -> DB) + simulator
 ├── preprocess/
 │   └── features.py       # Flow record -> numeric feature vector (shared logic)
 ├── data/
@@ -27,8 +28,11 @@ reconshield-ml/
 │   └── processed/        # Cleaned splits + metrics.json (git-ignored)
 ├── models/               # *.joblib artifacts (git-ignored)
 ├── notebooks/            # CRISP-DM notebook (crisp_dm.ipynb) — dokumentasi laporan
+├── tests/                # pytest: kontrak fitur, pipeline, artefak model
 ├── config.py             # Single source of truth for paths + env config
+├── pytest.ini
 ├── requirements.txt
+├── requirements-dev.txt  # pytest
 └── .env.example
 ```
 
@@ -76,6 +80,53 @@ Outputs:
 Artefak CRISP-DM untuk laporan: jalankan `notebooks/crisp_dm.ipynb` (menyajikan data
 understanding → evaluasi dengan parameter & angka yang sama dengan `metrics.json`).
 
+### Training lagi dengan dataset baru
+
+**1. Cek header CSV dulu.** Kolom yang hilang diisi `0.0` secara diam-diam oleh
+`coerce_frame()` — model jadi sampah **tanpa error** (temuan A18). Harus ada 16 kolom fitur
+di atas + kolom `label`:
+
+```bash
+python -c "import pandas as pd; print(list(pd.read_csv('dataset-baru.csv', nrows=0).columns))"
+```
+
+**2. Training** — `--version` wajib diisi, jangan mengandalkan default (`MODEL_VERSION=v1.0.0`
+dari `.env`) supaya nama file tidak ketukar. Jangan pakai `--data` tanpa nilai juga:
+defaultnya `data/raw/flows.csv` (format lama 10 fitur):
+
+```bash
+pip install -r requirements-dev.txt      # sekali saja, untuk pytest
+python -m training.train_rf --data <path/ke/dataset-baru.csv> --target label --version v1.2.0
+```
+
+Nama file hasilnya selalu `models/Random_Forest_Classifier_<versi>.joblib` (dari `MODEL_NAME`
++ `--version`), sedangkan `data/processed/metrics.json` namanya **tetap** (di-timpa tiap
+training) dan kini memuat field `artefact` yang menunjuk file model di atas — supaya angka
+dashboard dan model di balik `/predict` tidak bisa tertukar.
+
+**Penamaan versi:**
+
+| Situasi | Versi | Alasan |
+|---|---|---|
+| Dataset baru / capture tambahan, lalu training ulang | `v1.2.0` | minor — data & kontrak sama |
+| Perbaikan kecil tanpa data baru | `v1.1.1` | patch |
+| Kontrak fitur berubah (16 → N) atau ganti algoritma | `v2.0.0` | major — sinkronkan `build_dataset.py` + retrain |
+
+⚠️ **Jangan pakai ulang versi lama.** `metrics.json` di-timpa, dan `sync_metrics_db` melakukan
+*upsert* berdasarkan `modelName+version` — baris riwayat lama di database ikut tertimpa.
+
+**3. Setelah training, urutan ini:**
+
+```bash
+python -m pytest -q                 # kontrak 16 fitur + perilaku pipeline masih hijau
+python -m training.sync_metrics_db  # push metrik ke PostgreSQL (butuh DATABASE_URL)
+```
+
+Lalu **restart uvicorn** — `load_model()` di-cache selama proses hidup, jadi API yang sudah
+jalan tidak otomatis ganti model. Terakhir, salin ulang artefak ke `../hasil-training/` bila
+arsip ikut diperbarui: folder itu berisi **salinan statis**, bukan tampilan otomatis dari
+`models/`.
+
 ## 2. Serve the metrics/inference API
 
 ```bash
@@ -105,11 +156,37 @@ python -m pipeline.simulate_netflow       # uji lokal tanpa lab (kirim paket v5 
 - `DATABASE_URL` diambil dari env atau `.env` — boleh persis salinan dari
   `reconshield-web/.env`; parameter khas Prisma (`?schema=...`) otomatis dibersihkan
   oleh `config._for_psycopg` sebelum dipakai psycopg2.
-- Insiden ditulis dengan `action=Pending` / `status=Review` — **bukan** `TARPIT`:
-  eksekusi mitigasi (A4) menunggu keputusan desain A20 (`docs/keputusan-a20-tarpit.md`).
+- Insiden ditulis dengan `action=Pending` / `status=Review` — **bukan** `TARPIT`: keputusan
+  desain A20 sudah final (**Desain A**, 27 Okt 2026 — `docs/keputusan-a20-tarpit.md`), jadi
+  eksekusi mitigasi (A4) tinggal diimplementasikan, bukan lagi menunggu keputusan.
 - Anti banjir: de-duplikasi per IP sumber (`--dedup-seconds`, default 60) dan port noise
   (2055/514/8291) dilewati — konsisten dengan `build_dataset.py`.
 - Log keluaran memuat latensi inference (rata-rata/p95/max) saat proses dihentikan.
+
+### Keamanan input NetFlow (T2)
+
+NetFlow v5 **tidak punya autentikasi** — siapa pun yang bisa mencapai `udp/2055` bisa
+menyuntik flow karangan dan membuat baris `detections` palsu (simulator
+`pipeline/simulate_netflow.py` membuktikannya). Pembatasan ada dua lapis:
+
+1. **Allowlist sumber** — set di `.env` atau lewat CLI (kosong = terima semua + warning):
+
+   ```bash
+   NETFLOW_ALLOWED_EXPORTERS="10.10.30.1"   # .env: IP router/collector
+   python -m pipeline.detect --allow-exporter 10.10.30.1 --allow-exporter 127.0.0.1
+   ```
+
+2. **Firewall di lab** — hanya izinkan collector (dan mesin server) berbicara ke 2055:
+
+   ```routingos
+   /ip firewall filter
+   add chain=input protocol=udp dst-port=2055 src-address=10.10.30.1 action=accept \
+       comment="ReconShield: NetFlow dari collector"
+   add chain=input protocol=udp dst-port=2055 action=drop \
+       comment="ReconShield: tolak NetFlow dari sumber lain"
+   ```
+
+Bukti bahwa paket dari luar bisa lolos menjadi bahan pembahasan keamanan di laporan.
 
 Terverifikasi end-to-end 25 Okt 2026 (test case BB-M1…BB-M5 di
 `../docs/black-box-testing.md`): simulator → pipeline → `INC-1057` masuk database.

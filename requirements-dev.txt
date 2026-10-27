@@ -1,0 +1,3 @@
+# Test tooling for reconshield-ml (kept out of requirements.txt on purpose).
+#   pip install -r requirements-dev.txt
+pytest>=8.3

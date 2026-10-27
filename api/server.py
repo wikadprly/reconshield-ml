@@ -72,10 +72,34 @@ def _latest_model_path() -> Path | None:
     return artefacts[-1] if artefacts else None
 
 
+def _recorded_artefact_path() -> Path | None:
+    """Artefact named by metrics.json, so metrics and inference stay in step.
+
+    `metrics.json` and `models/*.joblib` are written together when training but
+    can drift apart afterwards (a copied or deleted file, a hand-edited
+    metrics). The recorded name wins whenever that file still exists, so the
+    numbers the dashboard shows always describe the model `/predict` uses (T6).
+    Only the basename is honoured — the field can never escape `models/`.
+    """
+    if not config.METRICS_PATH.exists():
+        return None
+    try:
+        recorded = json.loads(config.METRICS_PATH.read_text(encoding="utf-8")).get("artefact")
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not recorded:
+        return None
+    path = config.MODELS_DIR / Path(str(recorded)).name
+    return path if path.exists() else None
+
+
 @lru_cache(maxsize=1)
 def load_model():
-    """Load the most recently trained artefact (cached for the process lifetime)."""
-    path = _latest_model_path()
+    """Load the artefact metrics.json describes, else the newest one.
+
+    Cached for the process lifetime — restart the service after retraining.
+    """
+    path = _recorded_artefact_path() or _latest_model_path()
     if path is None:
         raise FileNotFoundError(
             "No model artefact found. Run `python -m training.train_rf` first."

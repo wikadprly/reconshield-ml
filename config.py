@@ -60,6 +60,16 @@ def _for_psycopg(url: str | None) -> str | None:
 
 DATABASE_URL = _for_psycopg(os.getenv("DATABASE_URL"))
 
+# --- NetFlow input ----------------------------------------------------------
+#: Comma-separated exporter IPs that `pipeline.detect` accepts datagrams from.
+#: Empty (the default) accepts any source — NetFlow v5 is unauthenticated, so
+#: leaving it open lets any host that reaches udp/2055 inject incidents.
+NETFLOW_ALLOWED_EXPORTERS = frozenset(
+    ip.strip()
+    for ip in os.getenv("NETFLOW_ALLOWED_EXPORTERS", "").split(",")
+    if ip.strip()
+)
+
 # --- HTTP -----------------------------------------------------------------
 API_HOST = os.getenv("ML_API_HOST", "0.0.0.0")
 API_PORT = int(os.getenv("ML_API_PORT", "8000"))

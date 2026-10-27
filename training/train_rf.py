@@ -179,6 +179,10 @@ def main() -> int:
     metrics = evaluate(model, X_test, y_test, args.version, dataset=args.data.stem)
 
     artifact = config.MODELS_DIR / f"{config.MODEL_NAME.replace(' ', '_')}_{args.version}.joblib"
+    # Record which file these numbers belong to: api.server.load_model() reads it
+    # back, so the dashboard's metrics and the model behind /predict cannot drift
+    # apart (T6).
+    metrics["artefact"] = artifact.name
     joblib.dump(model, artifact)
     print(f"[train] saved model -> {artifact}")
 
