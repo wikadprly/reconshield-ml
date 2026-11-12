@@ -9,7 +9,7 @@ The two repositories are deliberately separate:
 | Folder | Stack | Responsibility |
 |---|---|---|
 | `reconshield-ml/` | Python (FastAPI + scikit-learn) | Train the model, serve inference, expose metrics |
-| `reconshield-web/` | Next.js 16 + PostgreSQL | Dashboard UI, service layer, MikroTik orchestration |
+| `reconshield-web/` | Next.js 16 + MariaDB | Dashboard UI, service layer, MikroTik orchestration |
 
 ## Folder layout
 
@@ -19,7 +19,7 @@ reconshield-ml/
 │   └── server.py         # FastAPI app: GET /model/metrics, POST /predict
 ├── training/
 │   ├── train_rf.py       # Train RandomForest -> models/*.joblib + metrics.json
-│   └── sync_metrics_db.py# Push latest metrics.json into PostgreSQL
+│   └── sync_metrics_db.py# Push latest metrics.json into MariaDB/MySQL
 ├── pipeline/            # detect.py (NetFlow -> model -> DB) + simulator
 ├── preprocess/
 │   └── features.py       # Flow record -> numeric feature vector (shared logic)
@@ -119,7 +119,7 @@ dashboard dan model di balik `/predict` tidak bisa tertukar.
 
 ```bash
 python -m pytest -q                 # kontrak 16 fitur + perilaku pipeline masih hijau
-python -m training.sync_metrics_db  # push metrik ke PostgreSQL (butuh DATABASE_URL)
+python -m training.sync_metrics_db  # push metrik ke MariaDB/MySQL (butuh DATABASE_URL)
 ```
 
 Lalu **restart uvicorn** — `load_model()` di-cache selama proses hidup, jadi API yang sudah
@@ -154,8 +154,7 @@ python -m pipeline.simulate_netflow       # uji lokal tanpa lab (kirim paket v5 
 ```
 
 - `DATABASE_URL` diambil dari env atau `.env` — boleh persis salinan dari
-  `reconshield-web/.env`; parameter khas Prisma (`?schema=...`) otomatis dibersihkan
-  oleh `config._for_psycopg` sebelum dipakai psycopg2.
+  `reconshield-web/.env`; koneksi MariaDB/MySQL dibuka oleh `config.connect_database`.
 - Insiden ditulis dengan `action=Pending` / `status=Review` — **bukan** `TARPIT`: keputusan
   desain A20 sudah final (**Desain A**, 27 Okt 2026 — `docs/keputusan-a20-tarpit.md`), jadi
   eksekusi mitigasi (A4) tinggal diimplementasikan, bukan lagi menunggu keputusan.
@@ -191,7 +190,7 @@ Bukti bahwa paket dari luar bisa lolos menjadi bahan pembahasan keamanan di lapo
 Terverifikasi end-to-end 25 Okt 2026 (test case BB-M1…BB-M5 di
 `../docs/black-box-testing.md`): simulator → pipeline → `INC-1057` masuk database.
 
-## 4. Sync metrics into PostgreSQL (optional but recommended)
+## 4. Sync metrics into MariaDB/MySQL (optional but recommended)
 
 Once trained, publish the numbers so the dashboard reads them from the
 `model_evaluations` table (source `database`) instead of hitting this API:
@@ -213,7 +212,7 @@ RECONSHIELD_USE_MOCK_DATA="true"   # set to "false" once the service is live
 ```
 
 The web service layer (`security-service.ts`) resolves data in this order for
-ML metrics: **PostgreSQL → this API → mock data**. Every result is labelled
+ML metrics: **MariaDB/MySQL → this API → mock data**. Every result is labelled
 with its `source` so the UI is honest about where numbers come from.
 
 ## Notes

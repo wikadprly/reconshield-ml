@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
+import pymysql
 from dotenv import load_dotenv
 
 # Load .env from the repository root (one level up from this file's directory).
@@ -44,21 +46,23 @@ TEST_SIZE = float(os.getenv("RF_TEST_SIZE", "0.2"))
 
 # --- Database (for sync_metrics_db.py + pipeline.detect) ------------------
 #: Same variable name as reconshield-web so one .env can describe the stack.
-def _for_psycopg(url: str | None) -> str | None:
-    """Strip Prisma-only query params (``schema=...``) from DATABASE_URL.
-
-    reconshield-web's .env carries a Prisma-style URL, but libpq/psycopg2
-    rejects unknown URI query parameters. Python only ever talks to the
-    database through psycopg2, so the cleanup happens once, here.
-    """
-    if not url or "?" not in url:
-        return url
-    base, _, query = url.partition("?")
-    keep = [part for part in query.split("&") if part and not part.startswith("schema=")]
-    return base + ("?" + "&".join(keep) if keep else "")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 
-DATABASE_URL = _for_psycopg(os.getenv("DATABASE_URL"))
+def connect_database(url: str, connect_timeout: int = 5):
+    """Open a PyMySQL connection from a mysql:// or mariadb:// URL."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("mysql", "mariadb"):
+        raise ValueError("DATABASE_URL must use the mysql:// or mariadb:// scheme")
+    return pymysql.connect(
+        host=parsed.hostname or "127.0.0.1",
+        port=parsed.port or 3306,
+        user=unquote(parsed.username or ""),
+        password=unquote(parsed.password or ""),
+        database=parsed.path.lstrip("/") or "reconshield",
+        charset="utf8mb4",
+        connect_timeout=connect_timeout,
+    )
 
 # --- NetFlow input ----------------------------------------------------------
 #: Comma-separated exporter IPs that `pipeline.detect` accepts datagrams from.

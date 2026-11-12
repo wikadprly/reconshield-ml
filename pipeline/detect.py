@@ -1,4 +1,4 @@
-"""Automatic detection pipeline: NetFlow v5 -> Random Forest -> PostgreSQL.
+"""Automatic detection pipeline: NetFlow v5 -> Random Forest -> MariaDB/MySQL.
 
 Closes the loop from proposal 6.2 (steps 3-6 and 11) that audit finding A3
 flagged as missing: flow records arrive over UDP, are transformed with the
@@ -31,7 +31,7 @@ import time
 from collections import deque
 
 import pandas as pd
-import psycopg2
+import pymysql
 
 import config
 from preprocess import features as F
@@ -126,7 +126,7 @@ def predict(model, flow: dict) -> tuple[str, float]:
 class DetectionStore:
     """Writes detections rows and survives the database going away.
 
-    The connection is established lazily and rebuilt on failure: a Postgres
+    The connection is established lazily and rebuilt on failure: a database
     restart used to leave this object holding a dead cursor for the rest of the
     process, silently discarding every later incident (T1). Failures now retry
     once through a fresh connection and are reported at a bounded rate instead
@@ -139,7 +139,7 @@ class DetectionStore:
     def __init__(self, database_url: str, dry_run: bool, connect=None):
         self.dry_run = dry_run
         self.database_url = database_url
-        self._connect = connect or psycopg2.connect
+        self._connect = connect or config.connect_database
         self.conn = None
         self.errors = 0
         self._last_error_log = 0.0
@@ -149,24 +149,24 @@ class DetectionStore:
 
     def _connect_or_raise(self) -> None:
         self.conn = self._connect(self.database_url, connect_timeout=5)
-        self.conn.autocommit = True
+        self.conn.autocommit(True)
 
     def _reconnect(self) -> bool:
         try:
             self._connect_or_raise()
             return True
-        except psycopg2.Error as exc:
+        except pymysql.err.Error as exc:
             self._report_error(f"DB reconnect failed: {exc}")
             return False
 
     def _healthy(self) -> bool:
-        return self.conn is not None and not self.conn.closed
+        return self.conn is not None and self.conn.open
 
     def _drop(self) -> None:
         if self.conn is not None:
             try:
                 self.conn.close()
-            except psycopg2.Error:
+            except pymysql.err.Error:
                 pass
         self.conn = None
 
@@ -191,14 +191,13 @@ class DetectionStore:
                 return None
             try:
                 return work(self.conn)
-            except psycopg2.Error as exc:
-                self._report_error(f"{what}: {exc.pgerror or exc}")
+            except pymysql.err.Error as exc:
+                self._report_error(f"{what}: {exc}")
                 self._drop()
         return None
 
-    #: Advisory-lock key that serialises `INC-####` allocation. Arbitrary but
-    #: fixed — it only has to be unique inside this application (T3).
-    ID_LOCK_KEY = 0x52534348_0001  # "RSCH" + 1
+    #: Named lock that serialises `INC-####` allocation (T3).
+    ID_LOCK_NAME = "reconshield_detection_id"
 
     def insert(self, flow: dict, label: str, confidence: float) -> str | None:
         if self.dry_run:
@@ -211,35 +210,52 @@ class DetectionStore:
         )
 
         def write(conn) -> str:
-            # Read the max id and insert inside ONE transaction holding an
-            # advisory lock. The old read-then-insert pair had no lock, so two
-            # writers could pick the same number and collide on the primary
-            # key (T3). Autocommit is restored even when the statement fails;
-            # `_run` then drops and rebuilds the connection.
-            previous_autocommit = conn.autocommit
-            conn.autocommit = False
+            # Read the max id and insert inside ONE transaction holding a named
+            # lock. The old read-then-insert pair had no lock, so two writers
+            # could pick the same number and collide on the primary key (T3).
+            previous_autocommit = conn.get_autocommit()
+            conn.autocommit(False)
+            locked = False
             try:
                 with conn.cursor() as cur:
-                    cur.execute("SELECT pg_advisory_xact_lock(%s)", (self.ID_LOCK_KEY,))
+                    cur.execute("SELECT GET_LOCK(%s, %s)", (self.ID_LOCK_NAME, 5))
+                    row = cur.fetchone()
+                    if not row or row[0] != 1:
+                        raise pymysql.err.OperationalError("could not acquire detection id lock")
+                    locked = True
                     cur.execute(
-                        "SELECT id FROM detections "
-                        "ORDER BY COALESCE(NULLIF(regexp_replace(id, '\\D', '', 'g'), '')::bigint, -1) "
-                        "DESC LIMIT 1"
+                        "SELECT MAX(CAST(SUBSTRING(id, 5) AS UNSIGNED)) "
+                        "FROM detections WHERE id LIKE 'INC-%'"
                     )
                     row = cur.fetchone()
-                    number = int("".join(ch for ch in row[0] if ch.isdigit())) + 1 if row else 1001
+                    number = int(row[0]) + 1 if row and row[0] is not None else 1001
                     detection_id = f"INC-{number}"
                     cur.execute(
-                        'INSERT INTO detections (id, "timestamp", "sourceIp", "sourcePort", '
-                        '"destinationIp", "destinationPort", classification, confidence, '
-                        'action, status, "createdAt", "updatedAt") '
+                        "INSERT INTO detections (id, `timestamp`, `sourceIp`, `sourcePort`, "
+                        "`destinationIp`, `destinationPort`, classification, confidence, "
+                        "action, status, `createdAt`, `updatedAt`) "
                         "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                         (detection_id,) + payload,
                     )
                 conn.commit()
                 return detection_id
+            except Exception:
+                try:
+                    conn.rollback()
+                except pymysql.err.Error:
+                    pass
+                raise
             finally:
-                conn.autocommit = previous_autocommit
+                if locked:
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute("SELECT RELEASE_LOCK(%s)", (self.ID_LOCK_NAME,))
+                    except pymysql.err.Error:
+                        pass
+                try:
+                    conn.autocommit(previous_autocommit)
+                except pymysql.err.Error:
+                    pass
 
         return self._run(write, "DB write failed")
 
@@ -297,8 +313,8 @@ def main() -> int:
 
     try:
         store = DetectionStore(config.DATABASE_URL or "", dry_run=args.dry_run)
-    except psycopg2.Error as exc:
-        print(f"[detect] cannot reach PostgreSQL: {exc}", file=sys.stderr)
+    except pymysql.err.Error as exc:
+        print(f"[detect] cannot reach MariaDB/MySQL: {exc}", file=sys.stderr)
         return 1
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((args.bind, args.port))

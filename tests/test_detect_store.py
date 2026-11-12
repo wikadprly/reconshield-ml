@@ -1,6 +1,6 @@
 """DetectionStore must survive a database that goes away (audit finding T1)."""
 
-import psycopg2
+import pymysql
 import pytest
 
 from pipeline.detect import DetectionStore
@@ -9,6 +9,7 @@ from pipeline.detect import DetectionStore
 class FakeCursor:
     def __init__(self, conn):
         self.conn = conn
+        self.current = ""
 
     def __enter__(self):
         return self
@@ -17,37 +18,50 @@ class FakeCursor:
         return False
 
     def execute(self, sql, _params=None):
-        self.conn.attempts.append(" ".join(sql.split()[:2]).lower())
+        self.current = " ".join(sql.split()).lower()
+        self.conn.attempts.append(self.current)
         if self.conn.broken:
-            raise psycopg2.OperationalError("server closed the connection unexpectedly")
+            raise pymysql.err.OperationalError("server closed the connection unexpectedly")
 
     def fetchone(self):
-        return ("INC-1057",)
+        if "get_lock" in self.current:
+            return (1,)
+        if "max(" in self.current:
+            return (1057,)
+        if "release_lock" in self.current:
+            return (1,)
+        return None
 
 
 class FakeConn:
-    """Minimal psycopg2 connection: autocommit, commit/rollback, cursor."""
+    """Minimal PyMySQL connection: autocommit, commit/rollback, cursor."""
 
     def __init__(self, broken=False):
-        self.closed = 0
+        self.open = True
         self.broken = broken
         self.attempts = []
-        self.autocommit = True
+        self._autocommit = True
         self.committed = False
 
     def cursor(self):
         return FakeCursor(self)
 
+    def get_autocommit(self):
+        return self._autocommit
+
+    def autocommit(self, value):
+        self._autocommit = bool(value)
+
     def commit(self):
         if self.broken:
-            raise psycopg2.OperationalError("connection lost during commit")
+            raise pymysql.err.OperationalError("connection lost during commit")
         self.committed = True
 
     def rollback(self):
         pass
 
     def close(self):
-        self.closed = 1
+        self.open = False
 
 
 def _flow():
@@ -66,10 +80,10 @@ def test_dry_run_never_touches_the_database():
 
 def test_startup_fails_fast_when_the_database_is_unreachable():
     def connect(*_args, **_kwargs):
-        raise psycopg2.OperationalError("no route to host")
+        raise pymysql.err.OperationalError("no route to host")
 
-    with pytest.raises(psycopg2.OperationalError):
-        DetectionStore("postgresql://unreachable/db", dry_run=False, connect=connect)
+    with pytest.raises(pymysql.err.OperationalError):
+        DetectionStore("mysql://unreachable/db", dry_run=False, connect=connect)
 
 
 def test_insert_reconnects_when_the_connection_dies():
@@ -81,7 +95,7 @@ def test_insert_reconnects_when_the_connection_dies():
         conns.append(conn)
         return conn
 
-    store = DetectionStore("postgresql://db", dry_run=False, connect=connect)
+    store = DetectionStore("mysql://db", dry_run=False, connect=connect)
     incident = store.insert(_flow(), "Reconnaissance", 0.97)
 
     assert len(conns) == 2, "the store should have opened a second connection"
@@ -95,22 +109,23 @@ def test_id_allocation_holds_one_lock_then_commits_once():
     def connect(*_args, **_kwargs):
         return FakeConn()
 
-    store = DetectionStore("postgresql://db", dry_run=False, connect=connect)
+    store = DetectionStore("mysql://db", dry_run=False, connect=connect)
     incident = store.insert(_flow(), "Reconnaissance", 0.97)
     conn = store.conn
 
     assert incident == "INC-1058"
-    assert conn.attempts[0] == "select pg_advisory_xact_lock(%s)", "lock must be taken first"
-    assert conn.attempts[1].startswith("select id"), "max id read inside the lock"
+    assert conn.attempts[0].startswith("select get_lock(%s, %s)"), "lock must be taken first"
+    assert conn.attempts[1].startswith("select max("), "max id read inside the lock"
+    assert conn.attempts[2].startswith("insert into detections"), "insert after max id"
     assert conn.committed, "id allocation + insert must commit together"
-    assert conn.autocommit is True, "autocommit must be restored afterwards"
+    assert conn.get_autocommit() is True, "autocommit must be restored afterwards"
 
 
 def test_total_outage_is_counted_instead_of_raising():
     def connect(*_args, **_kwargs):
         return FakeConn(broken=True)
 
-    store = DetectionStore("postgresql://db", dry_run=False, connect=connect)
+    store = DetectionStore("mysql://db", dry_run=False, connect=connect)
 
     assert store.insert(_flow(), "Reconnaissance", 0.97) is None
     assert store.errors >= 1

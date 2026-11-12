@@ -1,4 +1,4 @@
-"""Publish the latest metrics.json into PostgreSQL.
+"""Publish the latest metrics.json into MariaDB/MySQL.
 
 After training, the web dashboard can read metrics from the database instead of
 hitting this service (`security-service.ts` tries database -> API -> mock).
@@ -17,13 +17,13 @@ import sys
 import uuid
 from typing import Any
 
-import psycopg2
+import pymysql
 
 import config
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Sync metrics.json into PostgreSQL")
+    parser = argparse.ArgumentParser(description="Sync metrics.json into MariaDB/MySQL")
     parser.add_argument(
         "--metrics",
         default=None,
@@ -76,15 +76,15 @@ def main() -> int:
     validate(metrics)
 
     matrix = metrics["confusionMatrix"]
-    conn = psycopg2.connect(config.DATABASE_URL)
-    conn.autocommit = False
+    conn = config.connect_database(config.DATABASE_URL)
+    conn.autocommit(False)
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT id FROM model_evaluations
-                WHERE "modelName" = %s AND version = %s
-                ORDER BY "evaluatedAt" DESC
+                WHERE `modelName` = %s AND version = %s
+                ORDER BY `evaluatedAt` DESC
                 LIMIT 1
                 """,
                 (metrics["modelName"], metrics["version"]),
@@ -112,9 +112,9 @@ def main() -> int:
                 cur.execute(
                     """
                     UPDATE model_evaluations SET
-                        accuracy = %s, precision = %s, recall = %s, "f1Score" = %s,
-                        "trueNormal" = %s, "falseThreat" = %s, "missedThreat" = %s,
-                        "trueThreat" = %s, dataset = %s, samples = %s, "evaluatedAt" = %s
+                        `accuracy` = %s, `precision` = %s, `recall` = %s, `f1Score` = %s,
+                        `trueNormal` = %s, `falseThreat` = %s, `missedThreat` = %s,
+                        `trueThreat` = %s, dataset = %s, samples = %s, `evaluatedAt` = %s
                     WHERE id = %s
                     """,
                     values[2:] + (evaluation_id,),
@@ -124,9 +124,9 @@ def main() -> int:
                 cur.execute(
                     """
                     INSERT INTO model_evaluations
-                        (id, "modelName", version, accuracy, precision, recall, "f1Score",
-                         "trueNormal", "falseThreat", "missedThreat", "trueThreat",
-                         dataset, samples, "evaluatedAt")
+                        (id, `modelName`, version, `accuracy`, `precision`, `recall`, `f1Score`,
+                         `trueNormal`, `falseThreat`, `missedThreat`, `trueThreat`,
+                         dataset, samples, `evaluatedAt`)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (evaluation_id,) + values,
@@ -135,12 +135,12 @@ def main() -> int:
 
             # Replace feature importances wholesale so stale rows cannot linger.
             cur.execute(
-                'DELETE FROM feature_importances WHERE "evaluationId" = %s',
+                "DELETE FROM feature_importances WHERE `evaluationId` = %s",
                 (evaluation_id,),
             )
             for item in metrics["featureImportance"]:
                 cur.execute(
-                    "INSERT INTO feature_importances (id, feature, importance, \"evaluationId\") VALUES (%s, %s, %s, %s)",
+                    "INSERT INTO feature_importances (id, feature, importance, `evaluationId`) VALUES (%s, %s, %s, %s)",
                     (f"fi-{uuid.uuid4().hex[:20]}", item["feature"], float(item["importance"]), evaluation_id),
                 )
 
