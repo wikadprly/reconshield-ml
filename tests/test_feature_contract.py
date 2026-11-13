@@ -1,8 +1,9 @@
 """The 16-feature contract shared by training, the API and the detection pipeline.
 
-A regression here is silent by design: `coerce_frame` fills unknown columns with
-0.0, so a renamed feature trains and serves without raising while quietly
-producing an all-zero model (the A18 failure). These tests make it loud.
+The A18 failure was silent: a renamed feature trained and served without raising
+while quietly producing an all-zero model. `coerce_frame(strict=True)` — used by
+the training path via `select_features` — now makes a missing or non-numeric
+feature a hard error instead. These tests keep the contract loud.
 
 Changing the contract means changing *all* of: `preprocess/features.py`,
 `dataset/ta-recon/build_dataset.py`, the model (retrain) and this file.
@@ -54,6 +55,16 @@ def test_canonical_labels_are_unchanged():
     # The web UI renders exactly these two strings.
     assert (F.LABEL_NORMAL, F.LABEL_RECON) == ("Normal", "Reconnaissance")
     assert F.TARGET_COLUMN == "label"
+
+
+def test_training_path_rejects_a_renamed_feature():
+    """Renaming a feature must fail loudly on the training path (A18)."""
+    pd = pytest.importorskip("pandas")
+    frame = pd.DataFrame([{column: 1 for column in LAB_FEATURE_COLUMNS}])
+    frame = frame.rename(columns={"pkts_per_sec": "packet_rate"})
+
+    with pytest.raises(ValueError):
+        F.select_features(frame)
 
 
 def test_lab_dataset_carries_every_feature():

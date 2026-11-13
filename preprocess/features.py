@@ -85,16 +85,40 @@ def label_for(feature: str) -> str:
     return FEATURE_LABELS.get(feature, feature)
 
 
-def coerce_frame(frame: pd.DataFrame) -> pd.DataFrame:
+def coerce_frame(frame: pd.DataFrame, *, strict: bool = False) -> pd.DataFrame:
     """Return a numeric-only copy of `frame` restricted to FEATURE_COLUMNS.
 
-    Missing columns are created as zeros so partially-shaped records still
-    transform instead of raising. Non-numeric values are coerced to NaN then 0.
+    By default a partially-shaped record still transforms: missing columns are
+    created as zeros and non-numeric values become 0. That tolerance is right
+    for a single live flow, but it is exactly what hid the A18 failure during
+    training (a renamed/aggregated column silently trained an all-zero model).
+
+    Pass ``strict=True`` on the training path to turn those silent zeros into a
+    loud error: every FEATURE_COLUMNS column must be present, and a present
+    column must not contain non-numeric text.
     """
     out = pd.DataFrame(index=frame.index)
+
+    if strict:
+        missing = [column for column in FEATURE_COLUMNS if column not in frame.columns]
+        if missing:
+            raise ValueError(
+                f"feature frame is missing required columns {missing}; expected the "
+                f"{len(FEATURE_COLUMNS)}-feature contract {FEATURE_COLUMNS}. "
+                "Refusing to zero-fill silently (this is the A18 failure)."
+            )
+
     for column in FEATURE_COLUMNS:
         if column in frame.columns:
             values = pd.to_numeric(frame[column], errors="coerce")
+            if strict:
+                unparsed = frame[column].notna() & values.isna()
+                if bool(unparsed.any()):
+                    sample = frame[column][unparsed].iloc[0]
+                    raise ValueError(
+                        f"feature column '{column}' has a non-numeric value {sample!r}; "
+                        "expected a number."
+                    )
         else:
             values = pd.Series(0.0, index=frame.index, dtype="float64")
         out[column] = values.fillna(0.0)
@@ -106,9 +130,12 @@ def select_features(frame: pd.DataFrame) -> pd.DataFrame:
 
     Used during training where the CSV may contain extra helper columns. The
     resulting column order becomes the model's `feature_names_in_`.
+
+    Runs ``coerce_frame`` in strict mode: a training frame that is missing any
+    of the 16 features must fail loudly instead of training on zeros (A18).
     """
     usable = [c for c in frame.columns if c not in EXCLUDED_COLUMNS]
-    return coerce_frame(frame[usable]) if usable else coerce_frame(frame)
+    return coerce_frame(frame[usable], strict=True) if usable else coerce_frame(frame, strict=True)
 
 
 def flow_to_vector(flow: Mapping[str, Any]) -> list[float]:

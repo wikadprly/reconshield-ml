@@ -82,8 +82,9 @@ understanding → evaluasi dengan parameter & angka yang sama dengan `metrics.js
 
 ### Training lagi dengan dataset baru
 
-**1. Cek header CSV dulu.** Kolom yang hilang diisi `0.0` secara diam-diam oleh
-`coerce_frame()` — model jadi sampah **tanpa error** (temuan A18). Harus ada 16 kolom fitur
+**1. Cek header CSV dulu.** Sejak temuan A18, jalur training memakai
+`coerce_frame(strict=True)` (lewat `select_features`): kolom fitur yang hilang atau berisi
+teks **langsung `ValueError`**, bukan diisi `0.0` diam-diam. Harus ada 16 kolom fitur
 di atas + kolom `label`:
 
 ```bash
@@ -114,6 +115,14 @@ dashboard dan model di balik `/predict` tidak bisa tertukar.
 
 ⚠️ **Jangan pakai ulang versi lama.** `metrics.json` di-timpa, dan `sync_metrics_db` melakukan
 *upsert* berdasarkan `modelName+version` — baris riwayat lama di database ikut tertimpa.
+
+**Pembagian train/test (per-sesi).** `train_rf.py` tidak lagi memakai `train_test_split`
+acak yang mencampur flow dari satu IP sumber ke kedua sisi (kebocoran yang membuat skor
+terlihat lebih baik dari kenyataan). `split_train_test()` memilih, berurutan: **session-aware**
+(GroupShuffleSplit terstratifikasi per `src`), lalu **temporal** (baris terlama untuk train,
+terbaru untuk test bila ada `recv_ts`), lalu **stratified random** sebagai cadangan. Strategi
+yang dipakai dicetak saat training (`[train] split strategy: ...`). Dataset nyata (6.404 flow,
+339 IP sumber) memakai jalur session-aware dan **tidak ada IP yang bocor ke dua sisi**.
 
 **3. Setelah training, urutan ini:**
 
@@ -146,6 +155,12 @@ curl -X POST http://localhost:8000/predict -H "Content-Type: application/json" -
 Loop otomatis proposal §6.2 langkah 3–6 & 11 (temuan A3): terima NetFlow v5,
  ekstrak 16 fitur yang sama, klasifikasi dengan artefak model yang sama dengan API,
  tulis insiden ke tabel `detections` (label `Reconnaissance` saja secara default).
+
+Setiap insiden ditulis **bersama satu baris `evidence`** (temuan B1) dalam transaksi yang
+sama: vektor 16 fitur yang benar-benar dinilai model, `modelName`/`modelVersion` dari nama
+artefak yang di-serve, serta `policyVersion` + `policySnapshot` dari baris `mitigation_settings`
+(policy yang berlaku saat deteksi). Jadi dashboard selalu bisa menampilkan alasan klasifikasi,
+bukan hanya label — tanpa menunggu seed manual.
 
 ```bash
 python -m pipeline.detect                 # UDP 2055, butuh DATABASE_URL

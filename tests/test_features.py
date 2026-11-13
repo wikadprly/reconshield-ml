@@ -1,6 +1,7 @@
 """Feature transformation rules: order, coercion and column dropping."""
 
 import pandas as pd
+import pytest
 
 from preprocess import features as F
 
@@ -36,6 +37,23 @@ def test_select_features_drops_system_and_ip_columns():
     out = F.select_features(frame)
 
     assert list(out.columns) == F.FEATURE_COLUMNS
+
+
+def test_coerce_frame_strict_rejects_missing_columns():
+    with pytest.raises(ValueError):
+        F.coerce_frame(pd.DataFrame([{"prot": 6}]), strict=True)
+
+
+def test_coerce_frame_strict_rejects_non_numeric_values():
+    with pytest.raises(ValueError):
+        F.coerce_frame(pd.DataFrame([_row(prot="tcp")]), strict=True)
+
+
+def test_select_features_refuses_a_zero_fillable_frame():
+    # The A18 shape: a frame that is missing most features. Tolerant mode would
+    # zero-fill it; the training path must raise instead.
+    with pytest.raises(ValueError):
+        F.select_features(pd.DataFrame([{"prot": 6, "sport": 80}]))
 
 
 def test_flow_to_vector_follows_feature_order():

@@ -3,7 +3,7 @@
 import pymysql
 import pytest
 
-from pipeline.detect import DetectionStore
+from pipeline.detect import DetectionStore, model_identity
 
 
 class FakeCursor:
@@ -20,6 +20,7 @@ class FakeCursor:
     def execute(self, sql, _params=None):
         self.current = " ".join(sql.split()).lower()
         self.conn.attempts.append(self.current)
+        self.conn.calls.append((self.current, _params))
         if self.conn.broken:
             raise pymysql.err.OperationalError("server closed the connection unexpectedly")
 
@@ -40,6 +41,7 @@ class FakeConn:
         self.open = True
         self.broken = broken
         self.attempts = []
+        self.calls = []
         self._autocommit = True
         self.committed = False
 
@@ -132,3 +134,37 @@ def test_total_outage_is_counted_instead_of_raising():
     assert not store._healthy()
 
     store.close()
+
+
+def test_insert_writes_evidence_in_the_same_transaction():
+    def connect(*_args, **_kwargs):
+        return FakeConn()
+
+    store = DetectionStore(
+        "mysql://db", dry_run=False, connect=connect,
+        model_name="Random Forest Classifier", model_version="v1.1.0",
+    )
+    store.insert(_flow(), "Reconnaissance", 0.97)
+    conn = store.conn
+
+    evidence = [params for sql, params in conn.calls if sql.startswith("insert into evidence")]
+    assert len(evidence) == 1, "one evidence row per detection"
+    params = evidence[0]
+    assert params[1] == "INC-1058", "evidence points at the detection id"
+    assert params[6] == "Random Forest Classifier"
+    assert params[7] == "v1.1.0"
+    assert params[4] == 16, "featureCount must be the 16-feature contract"
+    assert conn.committed, "detection and evidence commit together"
+
+
+def test_model_identity_parses_the_artefact_version():
+    assert model_identity("Random_Forest_Classifier_v1.1.0.joblib") == (
+        "Random Forest Classifier",
+        "v1.1.0",
+    )
+
+
+def test_model_identity_falls_back_when_the_name_has_no_version():
+    name, version = model_identity("model.joblib")
+    assert name == "Random Forest Classifier"
+    assert version  # a non-empty fallback from config

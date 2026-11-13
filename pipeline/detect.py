@@ -6,6 +6,10 @@ flagged as missing: flow records arrive over UDP, are transformed with the
 same model artefact the API serves, and Reconnaissance hits are written to the
 `detections` table that `reconshield-web` renders.
 
+Every detection is written together with an `evidence` row (audit finding B1)
+holding the exact 16-feature vector, the model name/version and the active
+mitigation policy snapshot, so the dashboard can justify each classification.
+
 Mitigation (A4, RouterOS REST call) is intentionally NOT done here — it is
 gated on decision A20 (docs/keputusan-a20-tarpit.md). Detections are written
 with action="Pending" / status="Review" until that write path is approved.
@@ -24,11 +28,15 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
+import re
 import socket
 import struct
 import sys
 import time
+import uuid
 from collections import deque
+from pathlib import Path
 
 import pandas as pd
 import pymysql
@@ -57,6 +65,33 @@ LATENCY_WINDOW = 10_000
 #: How often expired de-duplication entries are dropped (T5). `last_seen` used
 #: to keep one key per source IP for the whole lifetime of the process.
 DEDUP_PRUNE_INTERVAL = 60.0
+
+#: Direction recorded on every evidence row (matches the web seed and the
+#: `Evidence.flowDirection` default).
+EVIDENCE_FLOW_DIRECTION = "external_to_protected"
+
+#: Policy snapshot used when `mitigation_settings` has no `default` row yet.
+#: Mirrors the Prisma schema defaults so an evidence row is always complete.
+DEFAULT_POLICY_SNAPSHOT: dict[str, object] = {
+    "mode": "Automatic",
+    "confidenceThreshold": 85,
+    "durationMinutes": 60,
+    "maxDurationMinutes": 360,
+    "maxActiveEntries": 50,
+    "addressList": "reconshield-tarpit-active",
+}
+
+
+def model_identity(artefact: str) -> tuple[str, str]:
+    """Return ``(modelName, modelVersion)`` for an evidence row.
+
+    `load_model()` returns the `.joblib` filename, e.g.
+    ``Random_Forest_Classifier_v1.1.0.joblib``; the version is the trailing
+    ``vX.Y.Z``. Falls back to ``config.MODEL_VERSION`` when the name is not in
+    that shape, so the recorded version always matches the served artefact.
+    """
+    match = re.search(r"(v\d+(?:\.\d+)*)$", Path(artefact).stem)
+    return config.MODEL_NAME, match.group(1) if match else config.MODEL_VERSION
 
 
 def prune_expired(last_seen: dict[str, float], now: float, window: float) -> dict[str, float]:
@@ -136,10 +171,19 @@ class DetectionStore:
     #: Minimum seconds between repeated failure messages.
     ERROR_LOG_INTERVAL = 30.0
 
-    def __init__(self, database_url: str, dry_run: bool, connect=None):
+    def __init__(
+        self,
+        database_url: str,
+        dry_run: bool,
+        connect=None,
+        model_name: str = config.MODEL_NAME,
+        model_version: str = config.MODEL_VERSION,
+    ):
         self.dry_run = dry_run
         self.database_url = database_url
         self._connect = connect or config.connect_database
+        self.model_name = model_name
+        self.model_version = model_version
         self.conn = None
         self.errors = 0
         self._last_error_log = 0.0
@@ -199,15 +243,47 @@ class DetectionStore:
     #: Named lock that serialises `INC-####` allocation (T3).
     ID_LOCK_NAME = "reconshield_detection_id"
 
+    @staticmethod
+    def _read_policy(cur) -> tuple[str, dict]:
+        """Return ``(policyVersion, policySnapshot)`` from the live policy row.
+
+        The snapshot mirrors `MitigationPolicy` in the web app so the evidence
+        row records *which* policy justified the classification. A missing row
+        (fresh database before seeding) falls back to the schema defaults.
+        """
+        cur.execute(
+            "SELECT mode, `confidenceThreshold`, `durationMinutes`, "
+            "`maxDurationMinutes`, `maxActiveEntries`, `addressList`, `updatedAt` "
+            "FROM mitigation_settings WHERE id = 'default'"
+        )
+        row = cur.fetchone()
+        if row is None:
+            return "policy-unseeded", dict(DEFAULT_POLICY_SNAPSHOT)
+        mode, threshold, duration, max_duration, max_entries, address_list, updated = row
+        snapshot = {
+            "mode": mode,
+            "confidenceThreshold": int(threshold),
+            "durationMinutes": int(duration),
+            "maxDurationMinutes": int(max_duration),
+            "maxActiveEntries": int(max_entries),
+            "addressList": address_list,
+        }
+        version = f"policy-{updated.strftime('%Y-%m-%d')}" if updated else "policy-unknown"
+        return version, snapshot
+
     def insert(self, flow: dict, label: str, confidence: float) -> str | None:
         if self.dry_run:
             return None
         now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+        confidence_pct = round(confidence * 100, 1)
         payload = (
             now, flow["src"], int(flow["sport"]),
             flow["dst"], int(flow["dport"]), label,
-            round(confidence * 100, 1), "Pending", "Review", now, now,
+            confidence_pct, "Pending", "Review", now, now,
         )
+        # The exact 16-feature vector the model scored, in the same order it was
+        # trained on, so the dashboard can show what justified the decision.
+        features = dict(zip(F.FEATURE_COLUMNS, F.flow_to_vector(flow)))
 
         def write(conn) -> str:
             # Read the max id and insert inside ONE transaction holding a named
@@ -236,6 +312,22 @@ class DetectionStore:
                         "action, status, `createdAt`, `updatedAt`) "
                         "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                         (detection_id,) + payload,
+                    )
+                    # Evidence is written in the same transaction as its
+                    # detection, so the dashboard never shows an incident
+                    # without the features that justified it (B1).
+                    policy_version, policy_snapshot = self._read_policy(cur)
+                    cur.execute(
+                        "INSERT INTO evidence (id, `detectionId`, `flowDirection`, features, "
+                        "`featureCount`, confidence, `modelName`, `modelVersion`, "
+                        "`policyVersion`, `policySnapshot`, `createdAt`) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        (
+                            f"ev-{uuid.uuid4().hex}", detection_id, EVIDENCE_FLOW_DIRECTION,
+                            json.dumps(features), len(F.FEATURE_COLUMNS), confidence_pct,
+                            self.model_name, self.model_version, policy_version,
+                            json.dumps(policy_snapshot), now,
+                        ),
                     )
                 conn.commit()
                 return detection_id
@@ -295,6 +387,8 @@ def main() -> int:
         print(f"[detect] {exc}", file=sys.stderr)
         return 1
 
+    model_name, model_version = model_identity(artefact)
+
     if not args.dry_run and not config.DATABASE_URL:
         print("[detect] DATABASE_URL is not set. Put it in reconshield-ml/.env "
               "(same value as reconshield-web/.env) or pass --dry-run.",
@@ -312,7 +406,12 @@ def main() -> int:
         print(f"[detect] exporter allowlist: {sorted(allowed)}")
 
     try:
-        store = DetectionStore(config.DATABASE_URL or "", dry_run=args.dry_run)
+        store = DetectionStore(
+            config.DATABASE_URL or "",
+            dry_run=args.dry_run,
+            model_name=model_name,
+            model_version=model_version,
+        )
     except pymysql.err.Error as exc:
         print(f"[detect] cannot reach MariaDB/MySQL: {exc}", file=sys.stderr)
         return 1
@@ -321,6 +420,7 @@ def main() -> int:
 
     mode = "DRY-RUN (no DB writes)" if args.dry_run else "DB writes ON"
     print(f"[detect] NetFlow v5 on udp/{args.port} ({args.bind}) | model={artefact} | {mode}")
+    print(f"[detect] evidence rows stamped model={model_name} {model_version}")
     print(f"[detect] dedup window={args.dedup_seconds}s | min-confidence={args.min_confidence}"
           + ("" if args.keep_noise_ports else f" | skipping noise ports {sorted(NOISE_PORTS)}"))
 

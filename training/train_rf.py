@@ -1,7 +1,8 @@
 """Train the RandomForest classifier for ReconShield.
 
 Reads a flow dataset from CSV, engineers features with the shared
-`preprocess.features` helpers, splits train/test, fits a RandomForest, then
+`preprocess.features` helpers, splits train/test (session-aware by source IP,
+falling back to temporal then stratified random), fits a RandomForest, then
 writes:
 
   * `models/<MODEL_NAME>_<MODEL_VERSION>.joblib` — the artefact served at inference
@@ -21,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
@@ -64,6 +66,95 @@ def build_model() -> RandomForestClassifier:
         random_state=config.RANDOM_STATE,
         n_jobs=-1,
     )
+
+
+#: Columns that identify one reconnaissance session. Every flow from the same
+#: source belongs to the same session, so keeping a source on one side of the
+#: split stops the model from memorising an attacker it has already seen.
+SESSION_COLUMNS = ("src", "src_ip", "sourceIp")
+
+#: Columns that order flows in time (used for a temporal fallback split).
+TIME_COLUMNS = ("recv_ts", "timestamp", "time")
+
+
+def _both_classes(labels: pd.Series) -> bool:
+    return labels.nunique() >= 2
+
+
+def _stratified_group_split(
+    groups: np.ndarray, labels: np.ndarray, test_size: float, random_state: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Hold out whole groups, keeping both classes on both sides.
+
+    Each class contributes roughly ``test_size`` of its source groups to the
+    test set (at least one, at most all-but-one), so a class whose flows all
+    come from distinct sources is still represented in train and test. Groups
+    never appear on both sides, so no source is memorised across the split.
+    """
+    rng = np.random.default_rng(random_state)
+    test_mask = np.zeros(len(groups), dtype=bool)
+    for klass in pd.unique(labels):
+        members = np.array(pd.unique(groups[labels == klass]))
+        rng.shuffle(members)
+        n_test = min(max(int(round(len(members) * test_size)), 1), len(members) - 1)
+        if n_test <= 0:
+            continue
+        test_mask |= np.isin(groups, members[:n_test])
+    return np.where(~test_mask)[0], np.where(test_mask)[0]
+
+
+def split_train_test(
+    frame: pd.DataFrame,
+    X: pd.DataFrame,
+    y: pd.Series,
+    test_size: float = config.TEST_SIZE,
+    random_state: int = config.RANDOM_STATE,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, str]:
+    """Split X/y without leaking one source IP across train and test.
+
+    A plain `train_test_split` scatters flows from the same source into both
+    sides, letting the model memorise the attacker and report an optimistic
+    score. Preference order:
+
+    1. **Session-aware** (stratified group split on the source-IP column).
+    2. **Temporal** (oldest rows train, newest rows test) when a timestamp exists.
+    3. **Stratified random** as the last resort.
+
+    Strategies 1-2 can leave a side with a single class (e.g. every
+    reconnaissance session sits at the end of the capture). When that happens we
+    fall back to the stratified random split so training still runs, and the
+    returned strategy string records which one was used.
+    """
+    n = len(X)
+
+    session_column = next((c for c in SESSION_COLUMNS if c in frame.columns), None)
+    if session_column is not None and n:
+        groups = frame[session_column].astype(str).to_numpy()
+        if len(set(groups)) >= 2 and _both_classes(y):
+            train_idx, test_idx = _stratified_group_split(
+                groups, y.to_numpy(), test_size, random_state
+            )
+            if len(train_idx) and len(test_idx) and _both_classes(y.iloc[train_idx]) and _both_classes(y.iloc[test_idx]):
+                return (
+                    X.iloc[train_idx], X.iloc[test_idx], y.iloc[train_idx], y.iloc[test_idx],
+                    f"session-aware (by {session_column})",
+                )
+
+    time_column = next((c for c in TIME_COLUMNS if c in frame.columns), None)
+    if time_column is not None and n:
+        order = np.argsort(frame[time_column].to_numpy(), kind="stable")
+        cut = int(n * (1 - test_size))
+        train_idx, test_idx = order[:cut], order[cut:]
+        if len(train_idx) and len(test_idx) and _both_classes(y.iloc[train_idx]) and _both_classes(y.iloc[test_idx]):
+            return (
+                X.iloc[train_idx], X.iloc[test_idx], y.iloc[train_idx], y.iloc[test_idx],
+                f"temporal (by {time_column})",
+            )
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=random_state, stratify=y,
+    )
+    return X_train, X_test, y_train, y_test, "stratified random (no usable session/time column)"
 
 
 def normalise_labels(series: pd.Series) -> pd.Series:
@@ -164,14 +255,11 @@ def main() -> int:
         print(f"[train] target has a single class ({y.unique()}); cannot train", file=sys.stderr)
         return 1
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=config.TEST_SIZE,
-        random_state=config.RANDOM_STATE,
-        stratify=y,
+    X_train, X_test, y_train, y_test, strategy = split_train_test(
+        frame, X, y, test_size=config.TEST_SIZE, random_state=config.RANDOM_STATE
     )
     print(f"[train] {len(X_train)} train / {len(X_test)} test rows, {X.shape[1]} features")
+    print(f"[train] split strategy: {strategy}")
 
     model = build_model()
     model.fit(X_train, y_train)
